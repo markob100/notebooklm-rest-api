@@ -1,5 +1,7 @@
 # 📘 notebooklm-rest-api
 
+[![Discord chat](https://img.shields.io/discord/359930650330923008?logo=discord)](https://discord.gg/SjHtURQKBc?utm_source=catswords)
+
 > A REST API wrapper for Google NotebookLM powered by `notebooklm-py`
 
 `notebooklm-rest-api` exposes the functionality of
