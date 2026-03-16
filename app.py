@@ -12,6 +12,32 @@ from pydantic import BaseModel
 
 from notebooklm import NotebookLMClient, RPCError  # notebooklm-py :contentReference[oaicite:2]{index=2}
 
+# Enum imports for string → enum conversion in artifact generation
+try:
+    from notebooklm.enums import (
+        InfographicStyle, InfographicOrientation, InfographicDetail,
+        AudioFormat, AudioLength,
+        VideoFormat, VideoStyle,
+        SlideDeckFormat, SlideDeckLength,
+        ReportFormat,
+        QuizQuantity, QuizDifficulty,
+    )
+    _ENUMS_AVAILABLE = True
+except ImportError:
+    # Fallback: try importing from top-level module
+    try:
+        from notebooklm import (
+            InfographicStyle, InfographicOrientation, InfographicDetail,
+            AudioFormat, AudioLength,
+            VideoFormat, VideoStyle,
+            SlideDeckFormat, SlideDeckLength,
+            ReportFormat,
+            QuizQuantity, QuizDifficulty,
+        )
+        _ENUMS_AVAILABLE = True
+    except ImportError:
+        _ENUMS_AVAILABLE = False
+
 
 # ----------------------------
 # Config / Security
@@ -55,6 +81,70 @@ def map_rpc_error(e: RPCError) -> HTTPException:
     if "rate" in msg.lower() or "429" in msg:
         return HTTPException(status_code=429, detail=msg)
     return HTTPException(status_code=502, detail=msg)
+
+
+# ----------------------------
+# String → Enum conversion
+# ----------------------------
+# Maps (artifact_type, option_key) → enum class.
+# notebooklm-py expects enum instances (e.g. InfographicStyle.LANDSCAPE),
+# but the REST API receives plain strings ("LANDSCAPE").
+_ENUM_MAP: Dict[str, Dict[str, Any]] = {}
+if _ENUMS_AVAILABLE:
+    _ENUM_MAP = {
+        "infographic": {
+            "style": InfographicStyle,
+            "orientation": InfographicOrientation,
+            "detail_level": InfographicDetail,
+        },
+        "audio": {
+            "audio_format": AudioFormat,
+            "audio_length": AudioLength,
+        },
+        "video": {
+            "video_format": VideoFormat,
+            "video_style": VideoStyle,
+        },
+        "slide_deck": {
+            "slide_format": SlideDeckFormat,
+            "slide_length": SlideDeckLength,
+        },
+        "report": {
+            "report_format": ReportFormat,
+        },
+        "quiz": {
+            "quantity": QuizQuantity,
+            "difficulty": QuizDifficulty,
+        },
+        "flashcards": {
+            "quantity": QuizQuantity,
+            "difficulty": QuizDifficulty,
+        },
+    }
+
+
+def _convert_enums(artifact_type: str, opts: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert string option values to enum instances where applicable."""
+    type_map = _ENUM_MAP.get(artifact_type, {})
+    if not type_map:
+        return opts
+    converted = {}
+    for key, value in opts.items():
+        enum_cls = type_map.get(key)
+        if enum_cls is not None and isinstance(value, str):
+            try:
+                converted[key] = enum_cls[value]  # lookup by name, e.g. InfographicStyle["LANDSCAPE"]
+            except KeyError:
+                # Try case-insensitive match
+                upper = value.upper()
+                try:
+                    converted[key] = enum_cls[upper]
+                except KeyError:
+                    # Pass through as-is — library will raise its own error
+                    converted[key] = value
+        else:
+            converted[key] = value
+    return converted
 
 
 # ----------------------------
@@ -360,6 +450,9 @@ async def generate_artifact(notebook_id: str, req: ArtifactGenerateReq):
         try:
             t = req.type
             opts = req.options or {}
+
+            # Convert string values to enum instances where the library expects enums
+            opts = _convert_enums(t, opts)
 
             if t == "audio":
                 status = await client.artifacts.generate_audio(notebook_id, **opts)
