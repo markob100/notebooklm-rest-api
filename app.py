@@ -184,6 +184,7 @@ class ArtifactGenerateReq(BaseModel):
     type: Literal[
         "audio",
         "video",
+        "cinematic-video",
         "report",
         "quiz",
         "flashcards",
@@ -456,6 +457,10 @@ async def generate_artifact(notebook_id: str, req: ArtifactGenerateReq):
 
             if t == "audio":
                 status = await client.artifacts.generate_audio(notebook_id, **opts)
+            elif t == "cinematic-video":
+                status = await client.artifacts.generate_cinematic_video(
+                    notebook_id, instructions=opts.get("instructions")
+                )
             elif t == "video":
                 status = await client.artifacts.generate_video(notebook_id, **opts)
             elif t == "report":
@@ -506,6 +511,7 @@ async def download_artifact(
     type: Literal[
         "audio",
         "video",
+        "cinematic-video",
         "infographic",
         "slide_deck",
         "report",
@@ -524,6 +530,7 @@ async def download_artifact(
     suffix_map = {
         "audio": ".mp4",
         "video": ".mp4",
+        "cinematic-video": ".mp4",
         "infographic": ".png",
         "slide_deck": ".pdf",
         "report": ".md",
@@ -539,7 +546,7 @@ async def download_artifact(
         try:
             if type == "audio":
                 await client.artifacts.download_audio(notebook_id, out_path, artifact_id=artifact_id)
-            elif type == "video":
+            elif type in ("video", "cinematic-video"):
                 await client.artifacts.download_video(notebook_id, out_path, artifact_id=artifact_id)
             elif type == "infographic":
                 await client.artifacts.download_infographic(notebook_id, out_path, artifact_id=artifact_id)
