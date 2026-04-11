@@ -105,7 +105,15 @@ if _ENUMS_AVAILABLE:
             "video_format": VideoFormat,
             "video_style": VideoStyle,
         },
+        "video-explainer": {
+            "video_format": VideoFormat,
+            "video_style": VideoStyle,
+        },
         "slide_deck": {
+            "slide_format": SlideDeckFormat,
+            "slide_length": SlideDeckLength,
+        },
+        "slide-detailed": {
             "slide_format": SlideDeckFormat,
             "slide_length": SlideDeckLength,
         },
@@ -184,11 +192,13 @@ class ArtifactGenerateReq(BaseModel):
     type: Literal[
         "audio",
         "video",
+        "video-explainer",
         "cinematic-video",
         "report",
         "quiz",
         "flashcards",
         "slide_deck",
+        "slide-detailed",
         "infographic",
         "data_table",
         "mind_map",
@@ -463,6 +473,14 @@ async def generate_artifact(notebook_id: str, req: ArtifactGenerateReq):
                 )
             elif t == "video":
                 status = await client.artifacts.generate_video(notebook_id, **opts)
+            elif t == "video-explainer":
+                # Force EXPLAINER format regardless of caller-supplied options.
+                # Plain "video" sidecar type produces the default BRIEF format.
+                if _ENUMS_AVAILABLE:
+                    opts["video_format"] = VideoFormat.EXPLAINER
+                else:
+                    opts["video_format"] = "EXPLAINER"
+                status = await client.artifacts.generate_video(notebook_id, **opts)
             elif t == "report":
                 status = await client.artifacts.generate_report(notebook_id, **opts)
             elif t == "quiz":
@@ -470,6 +488,13 @@ async def generate_artifact(notebook_id: str, req: ArtifactGenerateReq):
             elif t == "flashcards":
                 status = await client.artifacts.generate_flashcards(notebook_id, **opts)
             elif t == "slide_deck":
+                status = await client.artifacts.generate_slide_deck(notebook_id, **opts)
+            elif t == "slide-detailed":
+                # Force DETAILED_DECK slide_format. Download path returns pptx.
+                if _ENUMS_AVAILABLE:
+                    opts["slide_format"] = SlideDeckFormat.DETAILED_DECK
+                else:
+                    opts["slide_format"] = "DETAILED_DECK"
                 status = await client.artifacts.generate_slide_deck(notebook_id, **opts)
             elif t == "infographic":
                 status = await client.artifacts.generate_infographic(notebook_id, **opts)
@@ -511,9 +536,11 @@ async def download_artifact(
     type: Literal[
         "audio",
         "video",
+        "video-explainer",
         "cinematic-video",
         "infographic",
         "slide_deck",
+        "slide-detailed",
         "report",
         "mind_map",
         "data_table",
@@ -530,9 +557,11 @@ async def download_artifact(
     suffix_map = {
         "audio": ".mp4",
         "video": ".mp4",
+        "video-explainer": ".mp4",
         "cinematic-video": ".mp4",
         "infographic": ".png",
         "slide_deck": ".pdf",
+        "slide-detailed": ".pptx",
         "report": ".md",
         "mind_map": ".json",
         "data_table": ".csv",
@@ -546,12 +575,17 @@ async def download_artifact(
         try:
             if type == "audio":
                 await client.artifacts.download_audio(notebook_id, out_path, artifact_id=artifact_id)
-            elif type in ("video", "cinematic-video"):
+            elif type in ("video", "video-explainer", "cinematic-video"):
                 await client.artifacts.download_video(notebook_id, out_path, artifact_id=artifact_id)
             elif type == "infographic":
                 await client.artifacts.download_infographic(notebook_id, out_path, artifact_id=artifact_id)
             elif type == "slide_deck":
                 await client.artifacts.download_slide_deck(notebook_id, out_path, artifact_id=artifact_id)
+            elif type == "slide-detailed":
+                # DETAILED_DECK slide_format produces pptx via download.
+                await client.artifacts.download_slide_deck(
+                    notebook_id, out_path, artifact_id=artifact_id, output_format="pptx"
+                )
             elif type == "report":
                 await client.artifacts.download_report(notebook_id, out_path, artifact_id=artifact_id)
             elif type == "mind_map":
