@@ -132,7 +132,22 @@ if _ENUMS_AVAILABLE:
 
 
 def _convert_enums(artifact_type: str, opts: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert string option values to enum instances where applicable."""
+    """Convert string option values to enum instances where applicable.
+
+    Also normalises option keys that differ between the UI and notebooklm-py:
+      - ``targetLanguage`` (camelCase, used across the app's export UI to
+        align with ElevenLabs / internal artefacts) is renamed to
+        ``language``, which every ``generate_*`` method in notebooklm-py
+        accepts as a strict kwarg (``language: str = "en"``). Without this
+        rename the call would 500 with ``TypeError: unexpected keyword
+        argument 'targetLanguage'``.
+    """
+    # Key normalisation — run before enum conversion so camelCase doesn't
+    # mask an enum mapping. Currently only targetLanguage needs renaming.
+    if "targetLanguage" in opts:
+        opts = {**opts, "language": opts["targetLanguage"]}
+        opts.pop("targetLanguage", None)
+
     type_map = _ENUM_MAP.get(artifact_type, {})
     if not type_map:
         return opts
@@ -468,8 +483,13 @@ async def generate_artifact(notebook_id: str, req: ArtifactGenerateReq):
             if t == "audio":
                 status = await client.artifacts.generate_audio(notebook_id, **opts)
             elif t == "cinematic-video":
+                # Forward language alongside instructions so non-English
+                # dashboards still produce a localised cinematic video.
+                cine_kwargs = {"instructions": opts.get("instructions")}
+                if "language" in opts:
+                    cine_kwargs["language"] = opts["language"]
                 status = await client.artifacts.generate_cinematic_video(
-                    notebook_id, instructions=opts.get("instructions")
+                    notebook_id, **cine_kwargs
                 )
             elif t == "video":
                 status = await client.artifacts.generate_video(notebook_id, **opts)
