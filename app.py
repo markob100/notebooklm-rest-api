@@ -10,7 +10,16 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from notebooklm import NotebookLMClient, RPCError  # notebooklm-py :contentReference[oaicite:2]{index=2}
+from notebooklm import (
+    NotebookLMClient,
+    RPCError,
+    AuthError,
+    RateLimitError,
+    NetworkError,
+    ServerError,
+    ClientError,
+    NotebookLMError,
+)  # notebooklm-py :contentReference[oaicite:2]{index=2}
 
 # Enum imports for string → enum conversion in artifact generation
 try:
@@ -57,30 +66,170 @@ def require_api_key(x_api_key: Optional[str] = None):
 
 
 async def get_client() -> NotebookLMClient:
-    """
-    Creates a client using notebooklm-py's supported auth precedence:
-    - explicit path to from_storage()
-    - NOTEBOOKLM_AUTH_JSON
-    - NOTEBOOKLM_HOME/storage_state.json
-    - ~/.notebooklm/storage_state.json
-    :contentReference[oaicite:3]{index=3}
+    """Create a NotebookLMClient from the shared storage session.
+
+    Auth precedence (delegated to notebooklm-py):
+      - explicit path (``AUTH_STORAGE_PATH`` env → ``NOTEBOOKLM_STORAGE_PATH``)
+      - ``NOTEBOOKLM_AUTH_JSON``
+      - ``NOTEBOOKLM_HOME/storage_state.json``
+      - ``~/.notebooklm/storage_state.json``
+
+    BYO-cookies (per-request user sessions) is deferred — see reg-monitor-app
+    BACKLOG item #64. The upstream ``notebooklm-py==0.3.4`` pinned in
+    requirements.txt does not expose a stateless ``NotebookLMClient.from_cookies``
+    entry point today, so any BYO path would 500 on import against the pinned
+    version. The stateless entry will be vendored locally into the sidecar
+    when that feature lands, rather than taking on an upstream dependency.
     """
     try:
         if AUTH_STORAGE_PATH:
             return await NotebookLMClient.from_storage(AUTH_STORAGE_PATH)
         return await NotebookLMClient.from_storage()
+    except ValueError as e:
+        msg = str(e)
+        code = "AUTH_INVALID"
+        if "expired" in msg.lower() or "redirected" in msg.lower():
+            code = "AUTH_EXPIRED"
+        raise HTTPException(
+            status_code=401,
+            detail={"code": code, "message": msg, "recoverable": True},
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "AUTH_NOT_CONFIGURED",
+                "message": str(e),
+                "recoverable": False,
+            },
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to initialize NotebookLM client: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "INIT_FAILED",
+                "message": f"Failed to initialize NotebookLM client: {e}",
+                "recoverable": False,
+            },
+        )
 
 
-def map_rpc_error(e: RPCError) -> HTTPException:
-    # notebooklm-py raises RPCError for API failures :contentReference[oaicite:4]{index=4}
-    msg = str(e)
-    if "401" in msg or "403" in msg or "auth" in msg.lower():
-        return HTTPException(status_code=401, detail=msg)
-    if "rate" in msg.lower() or "429" in msg:
-        return HTTPException(status_code=429, detail=msg)
-    return HTTPException(status_code=502, detail=msg)
+def map_notebooklm_error(e: Exception) -> HTTPException:
+    """Map notebooklm-py exceptions to structured HTTPException responses.
+
+    Returns a JSON ``detail`` body with:
+      - ``code``: one of AUTH_EXPIRED / AUTH_INVALID / RATE_LIMITED /
+        SERVER_ERROR / CLIENT_ERROR / NETWORK / RPC_ERROR
+      - ``message``: human-readable message
+      - ``recoverable``: whether a retry (or re-auth for AUTH_*) is sensible
+      - ``retry_after``: seconds to wait before retry (RATE_LIMITED only)
+      - ``status_code``: upstream HTTP status where available
+
+    Status codes:
+      - 401 on AuthError
+      - 429 on RateLimitError (with Retry-After surfaced)
+      - 502 on ServerError / generic RPCError (upstream is unhealthy)
+      - 504 on NetworkError / timeout (we couldn't reach upstream)
+      - 400 on ClientError (bad input to upstream)
+    """
+    if isinstance(e, AuthError):
+        msg = str(e)
+        # AuthError.recoverable is a class attr; default False but instances
+        # may override. We treat all as recoverable with re-auth.
+        code = "AUTH_EXPIRED" if getattr(e, "recoverable", False) else "AUTH_INVALID"
+        # Fallback on message content when recoverable attr isn't set
+        if "expired" in msg.lower():
+            code = "AUTH_EXPIRED"
+        return HTTPException(
+            status_code=401,
+            detail={
+                "code": code,
+                "message": msg,
+                "recoverable": True,
+                "method_id": getattr(e, "method_id", None),
+            },
+        )
+    if isinstance(e, RateLimitError):
+        detail = {
+            "code": "RATE_LIMITED",
+            "message": str(e),
+            "recoverable": True,
+            "retry_after": getattr(e, "retry_after", None),
+            "method_id": getattr(e, "method_id", None),
+        }
+        headers = {}
+        if detail["retry_after"] is not None:
+            headers["Retry-After"] = str(detail["retry_after"])
+        return HTTPException(status_code=429, detail=detail, headers=headers or None)
+    if isinstance(e, ServerError):
+        return HTTPException(
+            status_code=502,
+            detail={
+                "code": "SERVER_ERROR",
+                "message": str(e),
+                "recoverable": True,
+                "upstream_status": getattr(e, "status_code", None),
+                "method_id": getattr(e, "method_id", None),
+            },
+        )
+    if isinstance(e, ClientError):
+        return HTTPException(
+            status_code=400,
+            detail={
+                "code": "CLIENT_ERROR",
+                "message": str(e),
+                "recoverable": False,
+                "upstream_status": getattr(e, "status_code", None),
+                "method_id": getattr(e, "method_id", None),
+            },
+        )
+    if isinstance(e, NetworkError):
+        return HTTPException(
+            status_code=504,
+            detail={
+                "code": "NETWORK",
+                "message": str(e),
+                "recoverable": True,
+                "method_id": getattr(e, "method_id", None),
+            },
+        )
+    if isinstance(e, RPCError):
+        # Any other RPC error — generic upstream failure
+        return HTTPException(
+            status_code=502,
+            detail={
+                "code": "RPC_ERROR",
+                "message": str(e),
+                "recoverable": False,
+                "method_id": getattr(e, "method_id", None),
+            },
+        )
+    if isinstance(e, NotebookLMError):
+        return HTTPException(
+            status_code=502,
+            detail={
+                "code": "NOTEBOOKLM_ERROR",
+                "message": str(e),
+                "recoverable": False,
+            },
+        )
+    # Unknown — surface generically
+    return HTTPException(
+        status_code=500,
+        detail={
+            "code": "UNKNOWN",
+            "message": str(e),
+            "recoverable": False,
+        },
+    )
+
+
+# Backward-compat shim: existing call sites use `map_rpc_error(e)`. Keep
+# that spelling working and route through the typed mapper so all call
+# sites benefit without touching every endpoint.
+def map_rpc_error(e: Exception) -> HTTPException:  # noqa: D401 — back-compat
+    """Backward-compatible alias for map_notebooklm_error()."""
+    return map_notebooklm_error(e)
 
 
 # ----------------------------
@@ -237,6 +386,65 @@ app = FastAPI(title="NotebookLM REST API (powered by notebooklm-py)")
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+# ----------------------------
+# Auth
+# ----------------------------
+@app.post("/v1/auth/refresh")
+async def refresh_auth_endpoint(
+    client: NotebookLMClient = Depends(get_client),
+):
+    """Refresh CSRF/session tokens against the current NotebookLM session.
+
+    Used by long-lived callers (BYO-auth extension, background workers) to
+    proactively rotate the short-lived ``SNlM0e`` and ``FdrFJe`` tokens
+    before they go stale, without re-authenticating from scratch.
+
+    Auth precedence follows ``get_client``:
+      - ``X-NLM-Auth-Cookies`` header (per-request BYO cookies) — refresh
+        is scoped to the caller's own session.
+      - Shared storage session — refreshes the sidecar's default session.
+
+    Returns:
+        ``{"ok": True, "csrf_token": str, "session_id": str}`` on success.
+
+    Error envelope matches ``map_notebooklm_error`` (structured detail with
+    ``code`` / ``message`` / ``recoverable``). Typical failure is
+    ``AUTH_EXPIRED`` (401) when the underlying cookies themselves are
+    stale and a full re-login is needed.
+    """
+    async with client:
+        try:
+            tokens = await client.refresh_auth()
+            return {
+                "ok": True,
+                "csrf_token": tokens.csrf_token,
+                "session_id": tokens.session_id,
+            }
+        except ValueError as e:
+            # refresh_auth() raises ValueError on Google-auth redirect
+            # (cookies stale) and on failed regex extraction (page shape
+            # changed). Surface both as 401 AUTH_EXPIRED — the caller's
+            # remedy is to re-login regardless.
+            msg = str(e)
+            low = msg.lower()
+            code = "AUTH_EXPIRED" if ("expired" in low or "re-authenticate" in low) else "AUTH_INVALID"
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "code": code,
+                    "message": msg,
+                    "recoverable": True,
+                },
+            )
+        except HTTPException:
+            # Already a structured HTTPException from get_client — propagate.
+            raise
+        except Exception as e:
+            # Route through the typed mapper so AuthError / RateLimitError /
+            # NetworkError etc. all come back with the shared envelope.
+            raise map_notebooklm_error(e)
 
 
 # ----------------------------
