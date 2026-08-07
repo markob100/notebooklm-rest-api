@@ -65,6 +65,21 @@ except ImportError:
 API_KEY = os.environ.get("NOTEBOOKLM_REST_API_KEY", "")  # set this in production
 AUTH_STORAGE_PATH = os.environ.get("NOTEBOOKLM_STORAGE_PATH")  # optional override
 
+# Contents of master_token.json — {version, email, master_token, android_id} —
+# produced once by `notebooklm login --master-token`. notebooklm-py reads that
+# record from a file only; there is no env var for it upstream, so we carry it
+# in one of ours and materialise it at boot.
+#
+# Why bother: NOTEBOOKLM_AUTH_JSON pins a *snapshot* of a cookie jar, and
+# __Secure-1PSIDTS rotates on use — Google issues a new value and invalidates
+# the old one. So the snapshot dies whenever the same account is exercised
+# anywhere else, which is exactly how prod broke on 5 Aug. A master token is
+# durable and re-mints a fresh jar on demand over plain HTTP (gpsoauth), with
+# no browser, so the sidecar can heal itself instead of waiting for a re-push.
+MASTER_TOKEN_JSON = os.environ.get("NOTEBOOKLM_MASTER_TOKEN_JSON")
+
+_minted = False  # a jar has been minted from the master token in this process
+
 
 def require_api_key(x_api_key: Optional[str] = None):
     # Minimal API-key gate. Put this behind a real gateway (Cloudflare, Nginx, etc.) for production.
@@ -92,6 +107,57 @@ _client_cm: Any = None
 _client_lock = asyncio.Lock()
 
 
+async def _mint_from_master_token() -> bool:
+    """Mint a fresh cookie jar from the master token and make it the active auth.
+
+    Returns True when the profile now holds a freshly-minted jar. Failure is
+    non-fatal and deliberately quiet about credentials: we fall back to whatever
+    NOTEBOOKLM_AUTH_JSON already provides, so enabling this can only improve on
+    the previous behaviour, never break it.
+    """
+    global _minted
+    if not MASTER_TOKEN_JSON:
+        return False
+    try:
+        from notebooklm.paths import get_master_token_path, get_storage_path
+        from notebooklm._auth.master_token import (
+            read_master_token, mint_cookies, persist_minted_jar,
+        )
+
+        token_path = get_master_token_path()
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(MASTER_TOKEN_JSON, encoding="utf-8")
+        os.chmod(token_path, 0o600)
+
+        record = read_master_token(token_path)
+        if not record:
+            print("[auth] master token record unreadable; leaving existing auth in place")
+            return False
+
+        # mint_cookies is itself a coroutine — it off-threads the blocking
+        # gpsoauth call internally. Wrapping it in asyncio.to_thread yields a
+        # coroutine object rather than a jar, which fails later and confusingly.
+        jar = await mint_cookies(
+            record["email"], record["master_token"], record["android_id"]
+        )
+        storage_path = get_storage_path()
+        persist_minted_jar(storage_path, jar, email=record["email"])
+        os.chmod(storage_path, 0o600)
+
+        # The env jar takes precedence over the profile everywhere in 0.8.0, so
+        # a stale snapshot would shadow what we just minted. Drop it in-process
+        # only; the Railway variable stays untouched as a fallback for the next
+        # boot if minting ever stops working.
+        os.environ.pop("NOTEBOOKLM_AUTH_JSON", None)
+        _minted = True
+        print(f"[auth] minted a fresh cookie jar from the master token ({len(jar)} cookies)")
+        return True
+    except Exception as e:  # noqa: BLE001 - never let auth setup kill the process
+        print(f"[auth] master-token mint failed ({type(e).__name__}: {e}); "
+              "falling back to NOTEBOOKLM_AUTH_JSON")
+        return False
+
+
 async def _close_client() -> None:
     """Exit the shared client's context manager, ignoring teardown errors."""
     global _client, _client_cm
@@ -110,9 +176,14 @@ async def reset_client() -> None:
     have been rotated underneath us (Railway var update + redeploy, or an
     operator re-running ``notebooklm login``), and a rebuild picks them up
     without a process restart.
+
+    Also clears the minted flag, so a master-token deployment re-mints on the
+    next request rather than rebuilding a client around the same dead jar.
     """
+    global _minted
     async with _client_lock:
         await _close_client()
+        _minted = False
 
 
 async def get_client() -> NotebookLMClient:
@@ -138,6 +209,11 @@ async def get_client() -> NotebookLMClient:
         # Re-check under the lock: a concurrent caller may have built it.
         if _client is not None:
             return _client
+        # Mint before building. On a cold start this replaces whatever stale
+        # snapshot is lying around; after an auth failure reset_client() has
+        # cleared the flag, so this is also the self-heal path.
+        if MASTER_TOKEN_JSON and not _minted:
+            await _mint_from_master_token()
         try:
             cm = (
                 NotebookLMClient.from_storage(AUTH_STORAGE_PATH)
