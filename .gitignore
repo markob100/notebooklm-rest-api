@@ -1,0 +1,25 @@
+# Secrets — this service holds Google session credentials. Never commit them.
+.env
+.env.*
+!.env.example
+*storage_state*.json
+*master_token*.json
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.Python
+*.egg-info/
+
+# Playwright / browser profiles (account-equivalent credentials)
+.playwright/
+playwright-profile/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
