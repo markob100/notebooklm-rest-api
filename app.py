@@ -141,7 +141,20 @@ async def _mint_from_master_token() -> bool:
             record["email"], record["master_token"], record["android_id"]
         )
         storage_path = get_storage_path()
-        persist_minted_jar(storage_path, jar, email=record["email"])
+        # notebooklm-py 0.8.1 added ``refuse_unknown_owner`` (default True): it
+        # refuses to replace an existing storage_state.json that carries NO
+        # recorded owner. This sidecar is single-account and its storage is
+        # written only by this mint (owner recorded) or by an operator-supplied
+        # jar (no owner), so the refusal could only ever demote us to the stale
+        # env snapshot — the exact failure the master token exists to heal.
+        # Pass False, as the library's own remint path does; ``force`` stays
+        # off so a jar recorded to a DIFFERENT account is still refused.
+        try:
+            persist_minted_jar(
+                storage_path, jar, email=record["email"], refuse_unknown_owner=False
+            )
+        except TypeError:  # pragma: no cover - notebooklm-py < 0.8.1 lacks the kwarg
+            persist_minted_jar(storage_path, jar, email=record["email"])
         os.chmod(storage_path, 0o600)
 
         # The env jar takes precedence over the profile everywhere in 0.8.0, so
