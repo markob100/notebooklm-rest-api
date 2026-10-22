@@ -85,6 +85,9 @@ def test_failed_mint_is_503_and_cooled_down():
         return await real()
 
     sidecar._mint_from_master_token = counting
+    logged = []
+    real_error = sidecar.log.error
+    sidecar.log.error = lambda msg, *a, **k: (logged.append(msg), real_error(msg, *a, **k))
     try:
         sidecar._mint_failed_at = 0.0
         for _ in range(2):
@@ -93,8 +96,13 @@ def test_failed_mint_is_503_and_cooled_down():
             assert r.json()["detail"]["code"] == "AUTH_MINT_FAILED", r.text
         # The second request fell inside MINT_RETRY_SECONDS: no second attempt.
         assert calls["n"] == 1, calls
+        # It failed on the junk RECORD, not on a missing library name: an
+        # ImportError here means the venv predates the pin (or a bump moved
+        # the private master-token helpers) and the test proves nothing.
+        assert logged and all("ImportError" not in m and "ModuleNotFound" not in m for m in logged), logged
     finally:
         sidecar._mint_from_master_token = real
+        sidecar.log.error = real_error
 
 
 def test_refuses_to_boot_on_railway_without_a_key():
