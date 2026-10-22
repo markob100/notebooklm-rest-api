@@ -32,7 +32,8 @@ def test_health_is_open():
 
 def test_docs_are_off():
     for path in ("/docs", "/redoc", "/openapi.json"):
-        assert client.get(path).status_code == 404, path
+        assert client.get(path).status_code == 401, path  # gate first
+        assert client.get(path, headers={"X-API-Key": KEY}).status_code == 404, path
 
 
 def test_every_v1_route_requires_the_key():
@@ -51,6 +52,28 @@ def test_missing_wrong_and_non_ascii_keys_are_401():
         r = client.get("/v1/notebooks", headers=headers)
         assert r.status_code == 401, (headers, r.status_code, r.text)
         assert r.json()["detail"]["code"] == "API_KEY_INVALID", r.text
+
+
+def test_key_is_checked_before_the_body_is_read():
+    # Without the middleware these were 422 (bad JSON) and an upload spooled
+    # to disk before the router dependency ran.
+    r = client.post("/v1/notebooks", content=b"{not json", headers={"Content-Type": "application/json"})
+    assert r.status_code == 401, r.text
+    r = client.post("/v1/notebooks/nb/sources/file", files={"file": ("a.txt", b"x" * 1024)})
+    assert r.status_code == 401, r.text
+    assert r.json()["detail"]["code"] == "API_KEY_INVALID", r.text
+
+
+def test_unknown_paths_fail_closed():
+    assert client.get("/nope").status_code == 401
+    assert client.get("/nope", headers={"X-API-Key": KEY}).status_code == 404
+
+
+def test_mint_log_redacts_token_shaped_text():
+    msg = sidecar._redact("bad token aas_et/AKppINaVeryLongSecretValue1234567890 for x")
+    assert "AKppIN" not in msg and "[redacted]" in msg, msg
+    assert sidecar._redact("Unreadable master_token.json: Expecting value") == \
+        "Unreadable master_token.json: Expecting value"
 
 
 def test_failed_mint_is_503_and_cooled_down():

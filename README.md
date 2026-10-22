@@ -125,9 +125,11 @@ Swagger UI is switched off (`/docs` would sit outside the API-key gate).
 
 ## 🔐 API Key Protection
 
-Every `/v1` route requires an `X-API-Key` header matching
-`NOTEBOOKLM_REST_API_KEY` (compared in constant time). Only `/health` is open,
-and the interactive `/docs`, `/redoc` and `/openapi.json` pages are switched off.
+Every route except `/health` requires an `X-API-Key` header matching
+`NOTEBOOKLM_REST_API_KEY` (compared in constant time), checked in an ASGI
+middleware before any request body is read, so a caller without the key cannot
+make the service parse JSON or spool an upload. The interactive `/docs`,
+`/redoc` and `/openapi.json` pages are switched off.
 
 ```bash
 export NOTEBOOKLM_REST_API_KEY=your-secret-key

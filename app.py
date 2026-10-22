@@ -5,6 +5,7 @@ import asyncio
 import hmac
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -12,7 +13,7 @@ import tempfile
 from typing import Any, Optional, Literal, Dict
 
 from fastapi import APIRouter, FastAPI, UploadFile, File, Form, HTTPException, Depends, Header
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from notebooklm import (
@@ -118,29 +119,35 @@ _mint_failed_at = 0.0  # monotonic time of the last failed mint; 0 = none since 
 MINT_RETRY_SECONDS = 60
 
 
+_KEY_REJECTED = {
+    "code": "API_KEY_INVALID",
+    "message": "Missing or wrong X-API-Key for the NotebookLM sidecar",
+    "recoverable": False,
+}
+
+
+def api_key_ok(x_api_key: Optional[str]) -> bool:
+    """True when the key matches, or when no key is configured (local dev only).
+
+    Constant time, as bytes: compare_digest on str raises for non-ASCII input,
+    which would turn a junk header into a 500.
+    """
+    if not API_KEY:
+        return True
+    return x_api_key is not None and hmac.compare_digest(
+        x_api_key.encode("utf-8"), API_KEY.encode("utf-8")
+    )
+
+
 def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
-    """Reject a /v1 request whose X-API-Key does not match NOTEBOOKLM_REST_API_KEY.
+    """Router-level copy of the gate the middleware applies (see _api_key_gate).
 
-    Compared in constant time, as bytes: compare_digest on str raises for
-    non-ASCII input, which would turn a junk header into a 500.
-
-    The detail carries its own code because a 401 from this service already
+    The rejection carries its own code because a 401 from this service already
     means "Google rejected the session" (AUTH_EXPIRED / AUTH_INVALID); a caller
     debugging cookies over what is really a key mismatch would waste an hour.
     """
-    if not API_KEY:
-        return
-    if x_api_key is None or not hmac.compare_digest(
-        x_api_key.encode("utf-8"), API_KEY.encode("utf-8")
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "code": "API_KEY_INVALID",
-                "message": "Missing or wrong X-API-Key for the NotebookLM sidecar",
-                "recoverable": False,
-            },
-        )
+    if not api_key_ok(x_api_key):
+        raise HTTPException(status_code=401, detail=_KEY_REJECTED)
 
 
 # Shared client, lazily built on first use and reused for the process lifetime.
@@ -157,6 +164,16 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API
 _client: Optional[NotebookLMClient] = None
 _client_cm: Any = None
 _client_lock = asyncio.Lock()
+
+
+def _redact(msg: str) -> str:
+    """Bound an exception message and blank anything token-shaped in it.
+
+    The mint handles a master token and mints cookies; a library error that
+    echoed either must not reach Railway logs. Diagnostic words survive
+    ("Unreadable master_token.json: Expecting value: line 1 column 1").
+    """
+    return re.sub(r"[A-Za-z0-9_\-./+=:%]{20,}", "[redacted]", msg)[:200]
 
 
 async def _mint_from_master_token() -> bool:
@@ -223,7 +240,7 @@ async def _mint_from_master_token() -> bool:
         return True
     except Exception as e:  # noqa: BLE001 - never let auth setup kill the process
         # Type and a bounded message only: the record itself never goes to a log.
-        log.error(f"[auth] NLM_MINT_FAILED: {type(e).__name__}: {str(e)[:200]}")
+        log.error(f"[auth] NLM_MINT_FAILED: {type(e).__name__}: {_redact(str(e))}")
         _mint_failed_at = time.monotonic()
         return False
 
@@ -633,6 +650,32 @@ app = FastAPI(
 # on the app itself, is open. Routes added with @app instead would be open, so
 # don't. The router is mounted at the bottom of this file, once its routes exist.
 v1 = APIRouter(dependencies=[Depends(require_api_key)])
+
+
+class _ApiKeyGate:
+    """Check the key before anything reads the body.
+
+    FastAPI parses a route's body (JSON, multipart uploads spooled to disk)
+    BEFORE it resolves dependencies, so the router dependency alone would let a
+    caller without the key make us spool an upload, or get a 422 instead of a
+    401. Every path but /health is gated here, so an unknown path fails closed
+    too; the router dependency stays as a second line. Pure ASGI rather than
+    @app.middleware("http"), so large artefact downloads stream untouched.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") != "/health":
+            key = next((v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"x-api-key"), None)
+            if not api_key_ok(key):
+                await JSONResponse(status_code=401, content={"detail": _KEY_REJECTED})(scope, receive, send)
+                return
+        await self.inner(scope, receive, send)
+
+
+app.add_middleware(_ApiKeyGate)
 
 
 @app.on_event("shutdown")
