@@ -106,6 +106,20 @@ def test_refuses_to_boot_on_railway_without_a_key():
     assert "NOTEBOOKLM_REST_API_KEY is not set" in r.stderr, r.stderr
 
 
+def test_no_master_token_on_railway_is_a_loud_503():
+    env = {k: v for k, v in os.environ.items() if k != "NOTEBOOKLM_MASTER_TOKEN_JSON"}
+    env["RAILWAY_ENVIRONMENT"] = "production"
+    code = (
+        "from fastapi.testclient import TestClient; import app; "
+        "r = TestClient(app.app).get('/v1/notebooks', headers={'X-API-Key': %r}); "
+        "print(r.status_code, r.json()['detail']['code'])" % KEY
+    )
+    r = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "503 AUTH_MINT_FAILED", r.stdout
+    assert "[auth] NLM_MINT_FAILED: NOTEBOOKLM_MASTER_TOKEN_JSON is not set" in r.stderr, r.stderr
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

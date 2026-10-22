@@ -110,6 +110,14 @@ AUTH_STORAGE_PATH = os.environ.get("NOTEBOOKLM_STORAGE_PATH")  # optional overri
 # no browser, so the sidecar can heal itself instead of waiting for a re-push.
 MASTER_TOKEN_JSON = os.environ.get("NOTEBOOKLM_MASTER_TOKEN_JSON")
 
+# On Railway the master token is the only credential: NOTEBOOKLM_AUTH_JSON has
+# been a placeholder jar since 22 Oct 2026. Without the token, say so at boot
+# and answer 503 rather than build a client on an empty jar and let Google's
+# rejection arrive as a 401 that looks like expired cookies.
+MASTER_TOKEN_MISSING = bool(os.environ.get("RAILWAY_ENVIRONMENT")) and not MASTER_TOKEN_JSON
+if MASTER_TOKEN_MISSING:
+    log.error("[auth] NLM_MINT_FAILED: NOTEBOOKLM_MASTER_TOKEN_JSON is not set; every /v1 route will answer 503")
+
 _minted = False  # a jar has been minted from the master token in this process
 _mint_failed_at = 0.0  # monotonic time of the last failed mint; 0 = none since the last success
 
@@ -305,6 +313,15 @@ async def get_client() -> NotebookLMClient:
         # else is on disk and let Google's rejection arrive later as a 401 that
         # looks like expired cookies. A recent failure answers without another
         # attempt (MINT_RETRY_SECONDS).
+        if MASTER_TOKEN_MISSING:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "AUTH_MINT_FAILED",
+                    "message": "NOTEBOOKLM_MASTER_TOKEN_JSON is not set on this deployment",
+                    "recoverable": False,
+                },
+            )
         if MASTER_TOKEN_JSON and not _minted:
             recently_failed = (
                 _mint_failed_at and time.monotonic() - _mint_failed_at < MINT_RETRY_SECONDS
