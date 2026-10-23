@@ -52,7 +52,7 @@ It allows you to manage Notebooks, add sources, perform Q&A, generate artifacts,
 * Task polling support
 * File download support
 
-### 🔐 Optional API Key Protection
+### 🔐 API Key Protection
 
 ---
 
@@ -119,27 +119,42 @@ export NOTEBOOKLM_STORAGE_PATH=/path/to/storage_state.json
 uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
-Swagger UI:
-
-```
-http://localhost:8000/docs
-```
+Swagger UI is switched off (`/docs` would sit outside the API-key gate).
 
 ---
 
-## 🔐 Optional API Key Protection
+## 🔐 API Key Protection
 
-Set API key:
+Every route except `/health` requires an `X-API-Key` header matching
+`NOTEBOOKLM_REST_API_KEY` (compared in constant time), checked in an ASGI
+middleware before any request body is read, so a caller without the key cannot
+make the service parse JSON or spool an upload. The interactive `/docs`,
+`/redoc` and `/openapi.json` pages are switched off.
 
 ```bash
 export NOTEBOOKLM_REST_API_KEY=your-secret-key
 ```
 
-Send header:
-
 ```
 X-API-Key: your-secret-key
 ```
+
+A missing or wrong key gets `401` with `detail.code = "API_KEY_INVALID"`
+(distinct from `AUTH_EXPIRED` / `AUTH_INVALID`, which mean Google rejected the
+session). With the key unset the routes are open, which is for local
+development only: on Railway (`RAILWAY_ENVIRONMENT` set) the service refuses to
+start without it.
+
+### Master-token auth
+
+With `NOTEBOOKLM_MASTER_TOKEN_JSON` set (the contents of `master_token.json`
+from `notebooklm login --master-token`), the first request mints a fresh cookie
+jar. If that mint fails, the service logs an error line starting
+`[auth] NLM_MINT_FAILED` and answers `/v1` routes with
+`503 AUTH_MINT_FAILED`, retrying the mint at most once a minute. It does not
+fall back to `NOTEBOOKLM_AUTH_JSON`.
+
+Tests: `.venv/bin/python tests/test_hardening.py`
 
 ---
 
@@ -222,7 +237,8 @@ GET /v1/notebooks/{notebook_id}/artifacts/download?type=quiz&output_format=json
 | NOTEBOOKLM_STORAGE_PATH | Path to storage_state.json |
 | NOTEBOOKLM_AUTH_JSON    | Inject auth JSON directly  |
 | NOTEBOOKLM_HOME         | Base notebooklm directory  |
-| NOTEBOOKLM_REST_API_KEY | REST API protection key    |
+| NOTEBOOKLM_REST_API_KEY | REST API key (required on Railway) |
+| NOTEBOOKLM_MASTER_TOKEN_JSON | master_token.json contents; mints cookies on demand |
 
 ---
 

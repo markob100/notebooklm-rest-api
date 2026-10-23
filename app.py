@@ -2,13 +2,18 @@
 # Namhyeon Go <gnh1201@catswords.re.kr>
 # https://github.com/gnh1201/notebooklm-rest-api
 import asyncio
+import hmac
+import logging
 import os
+import re
+import sys
+import time
 import uuid
 import tempfile
 from typing import Any, Optional, Literal, Dict
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, FastAPI, UploadFile, File, Form, HTTPException, Depends, Header
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from notebooklm import (
@@ -62,7 +67,34 @@ except ImportError:
 # ----------------------------
 # Config / Security
 # ----------------------------
-API_KEY = os.environ.get("NOTEBOOKLM_REST_API_KEY", "")  # set this in production
+# Own handlers rather than the root logger's: uvicorn configures only its own
+# loggers, and without a handler an INFO line here would be dropped. Warnings
+# and errors go to stderr, which Railway shows at error level; the rest stays
+# on stdout.
+log = logging.getLogger("notebooklm-rest-api")
+if not log.handlers:
+    _fmt = logging.Formatter("%(levelname)s %(message)s")
+    _out = logging.StreamHandler(sys.stdout)
+    _out.addFilter(lambda r: r.levelno < logging.WARNING)
+    _out.setFormatter(_fmt)
+    _err = logging.StreamHandler(sys.stderr)
+    _err.setLevel(logging.WARNING)
+    _err.setFormatter(_fmt)
+    log.addHandler(_out)
+    log.addHandler(_err)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+# Shared secret every /v1 caller must send as X-API-Key. On Railway the service
+# refuses to boot without it: this process holds a full-account Google
+# credential, so "reachable on the private network" is not enough on its own.
+API_KEY = os.environ.get("NOTEBOOKLM_REST_API_KEY", "")
+if not API_KEY:
+    if os.environ.get("RAILWAY_ENVIRONMENT"):
+        raise RuntimeError(
+            "NOTEBOOKLM_REST_API_KEY is not set; refusing to start on Railway without an API key"
+        )
+    log.warning("[auth] NOTEBOOKLM_REST_API_KEY is not set; /v1 routes are OPEN (local development only)")
 AUTH_STORAGE_PATH = os.environ.get("NOTEBOOKLM_STORAGE_PATH")  # optional override
 
 # Contents of master_token.json — {version, email, master_token, android_id} —
@@ -78,17 +110,52 @@ AUTH_STORAGE_PATH = os.environ.get("NOTEBOOKLM_STORAGE_PATH")  # optional overri
 # no browser, so the sidecar can heal itself instead of waiting for a re-push.
 MASTER_TOKEN_JSON = os.environ.get("NOTEBOOKLM_MASTER_TOKEN_JSON")
 
+# On Railway the master token is the only credential: NOTEBOOKLM_AUTH_JSON has
+# been a placeholder jar since 22 Oct 2026. Without the token, say so at boot
+# and answer 503 rather than build a client on an empty jar and let Google's
+# rejection arrive as a 401 that looks like expired cookies.
+MASTER_TOKEN_MISSING = bool(os.environ.get("RAILWAY_ENVIRONMENT")) and not MASTER_TOKEN_JSON
+if MASTER_TOKEN_MISSING:
+    log.error("[auth] NLM_MINT_FAILED: NOTEBOOKLM_MASTER_TOKEN_JSON is not set; every /v1 route will answer 503")
+
 _minted = False  # a jar has been minted from the master token in this process
+_mint_failed_at = 0.0  # monotonic time of the last failed mint; 0 = none since the last success
+
+# A failing mint is retried at most this often. Every attempt is a gpsoauth
+# exchange of a full-account credential, and hammering Google with a bad one
+# is a good way to get the account challenged.
+MINT_RETRY_SECONDS = 60
 
 
-def require_api_key(x_api_key: Optional[str] = None):
-    # Minimal API-key gate. Put this behind a real gateway (Cloudflare, Nginx, etc.) for production.
-    if API_KEY:
-        # FastAPI header parsing without extra imports (keep simple):
-        # Prefer: from fastapi import Header; def require_api_key(x_api_key: str = Header(None)) ...
-        # but we keep it minimal and rely on query param fallback too.
-        if x_api_key != API_KEY:
-            raise HTTPException(status_code=401, detail="Invalid API key")
+_KEY_REJECTED = {
+    "code": "API_KEY_INVALID",
+    "message": "Missing or wrong X-API-Key for the NotebookLM sidecar",
+    "recoverable": False,
+}
+
+
+def api_key_ok(x_api_key: Optional[str]) -> bool:
+    """True when the key matches, or when no key is configured (local dev only).
+
+    Constant time, as bytes: compare_digest on str raises for non-ASCII input,
+    which would turn a junk header into a 500.
+    """
+    if not API_KEY:
+        return True
+    return x_api_key is not None and hmac.compare_digest(
+        x_api_key.encode("utf-8"), API_KEY.encode("utf-8")
+    )
+
+
+def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
+    """Router-level copy of the gate the middleware applies (see _api_key_gate).
+
+    The rejection carries its own code because a 401 from this service already
+    means "Google rejected the session" (AUTH_EXPIRED / AUTH_INVALID); a caller
+    debugging cookies over what is really a key mismatch would waste an hour.
+    """
+    if not api_key_ok(x_api_key):
+        raise HTTPException(status_code=401, detail=_KEY_REJECTED)
 
 
 # Shared client, lazily built on first use and reused for the process lifetime.
@@ -107,15 +174,28 @@ _client_cm: Any = None
 _client_lock = asyncio.Lock()
 
 
+def _redact(msg: str) -> str:
+    """Bound an exception message and blank anything token-shaped in it.
+
+    The mint handles a master token and mints cookies; a library error that
+    echoed either must not reach Railway logs. Diagnostic words survive
+    ("Unreadable master_token.json: Expecting value: line 1 column 1").
+    """
+    return re.sub(r"[A-Za-z0-9_\-./+=:%]{20,}", "[redacted]", msg)[:200]
+
+
 async def _mint_from_master_token() -> bool:
     """Mint a fresh cookie jar from the master token and make it the active auth.
 
-    Returns True when the profile now holds a freshly-minted jar. Failure is
-    non-fatal and deliberately quiet about credentials: we fall back to whatever
-    NOTEBOOKLM_AUTH_JSON already provides, so enabling this can only improve on
-    the previous behaviour, never break it.
+    Returns True when the profile now holds a freshly-minted jar. A failure
+    never kills the process, but it is loud: an error line starting
+    ``[auth] NLM_MINT_FAILED`` (grep for that prefix), and get_client() answers
+    503 AUTH_MINT_FAILED instead of building a client. It used to fall back to
+    NOTEBOOKLM_AUTH_JSON quietly; since the 22 Oct 2026 rotation that variable
+    is a placeholder jar, so the fallback could only surface later as a
+    confusing Google-side auth error.
     """
-    global _minted
+    global _minted, _mint_failed_at
     if not MASTER_TOKEN_JSON:
         return False
     try:
@@ -131,7 +211,8 @@ async def _mint_from_master_token() -> bool:
 
         record = read_master_token(token_path)
         if not record:
-            print("[auth] master token record unreadable; leaving existing auth in place")
+            log.error("[auth] NLM_MINT_FAILED: NOTEBOOKLM_MASTER_TOKEN_JSON is not a readable master-token record")
+            _mint_failed_at = time.monotonic()
             return False
 
         # mint_cookies is itself a coroutine — it off-threads the blocking
@@ -159,15 +240,16 @@ async def _mint_from_master_token() -> bool:
 
         # The env jar takes precedence over the profile everywhere in 0.8.0, so
         # a stale snapshot would shadow what we just minted. Drop it in-process
-        # only; the Railway variable stays untouched as a fallback for the next
-        # boot if minting ever stops working.
+        # only.
         os.environ.pop("NOTEBOOKLM_AUTH_JSON", None)
         _minted = True
-        print(f"[auth] minted a fresh cookie jar from the master token ({len(jar)} cookies)")
+        _mint_failed_at = 0.0
+        log.info(f"[auth] minted a fresh cookie jar from the master token ({len(jar)} cookies)")
         return True
     except Exception as e:  # noqa: BLE001 - never let auth setup kill the process
-        print(f"[auth] master-token mint failed ({type(e).__name__}: {e}); "
-              "falling back to NOTEBOOKLM_AUTH_JSON")
+        # Type and a bounded message only: the record itself never goes to a log.
+        log.error(f"[auth] NLM_MINT_FAILED: {type(e).__name__}: {_redact(str(e))}")
+        _mint_failed_at = time.monotonic()
         return False
 
 
@@ -225,8 +307,35 @@ async def get_client() -> NotebookLMClient:
         # Mint before building. On a cold start this replaces whatever stale
         # snapshot is lying around; after an auth failure reset_client() has
         # cleared the flag, so this is also the self-heal path.
+        #
+        # A configured master token that will not mint is the whole story, so
+        # say so (503, retryable) rather than build a client around whatever
+        # else is on disk and let Google's rejection arrive later as a 401 that
+        # looks like expired cookies. A recent failure answers without another
+        # attempt (MINT_RETRY_SECONDS).
+        if MASTER_TOKEN_MISSING:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "AUTH_MINT_FAILED",
+                    "message": "NOTEBOOKLM_MASTER_TOKEN_JSON is not set on this deployment",
+                    "recoverable": False,
+                },
+            )
         if MASTER_TOKEN_JSON and not _minted:
-            await _mint_from_master_token()
+            recently_failed = (
+                _mint_failed_at and time.monotonic() - _mint_failed_at < MINT_RETRY_SECONDS
+            )
+            if recently_failed or not await _mint_from_master_token():
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "AUTH_MINT_FAILED",
+                        "message": "Could not mint Google cookies from NOTEBOOKLM_MASTER_TOKEN_JSON; "
+                                   "see the sidecar log lines starting [auth] NLM_MINT_FAILED",
+                        "recoverable": True,
+                    },
+                )
         try:
             cm = (
                 NotebookLMClient.from_storage(AUTH_STORAGE_PATH)
@@ -545,7 +654,45 @@ class TaskPollResp(BaseModel):
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="NotebookLM REST API (powered by notebooklm-py)")
+# No /docs, /redoc or /openapi.json: they would sit outside the key gate and
+# publish a map of every route.
+app = FastAPI(
+    title="NotebookLM REST API (powered by notebooklm-py)",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+# Every /v1 route lives on this router and so needs X-API-Key; only /health,
+# on the app itself, is open. Routes added with @app instead would be open, so
+# don't. The router is mounted at the bottom of this file, once its routes exist.
+v1 = APIRouter(dependencies=[Depends(require_api_key)])
+
+
+class _ApiKeyGate:
+    """Check the key before anything reads the body.
+
+    FastAPI parses a route's body (JSON, multipart uploads spooled to disk)
+    BEFORE it resolves dependencies, so the router dependency alone would let a
+    caller without the key make us spool an upload, or get a 422 instead of a
+    401. Every path but /health is gated here, so an unknown path fails closed
+    too; the router dependency stays as a second line. Pure ASGI rather than
+    @app.middleware("http"), so large artefact downloads stream untouched.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") != "/health":
+            key = next((v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"x-api-key"), None)
+            if not api_key_ok(key):
+                await JSONResponse(status_code=401, content={"detail": _KEY_REJECTED})(scope, receive, send)
+                return
+        await self.inner(scope, receive, send)
+
+
+app.add_middleware(_ApiKeyGate)
 
 
 @app.on_event("shutdown")
@@ -562,7 +709,7 @@ async def health():
 # ----------------------------
 # Auth
 # ----------------------------
-@app.post("/v1/auth/refresh")
+@v1.post("/v1/auth/refresh")
 async def refresh_auth_endpoint(
     client: NotebookLMClient = Depends(get_client),
 ):
@@ -626,7 +773,7 @@ async def refresh_auth_endpoint(
 # ----------------------------
 # Notebooks
 # ----------------------------
-@app.get("/v1/notebooks")
+@v1.get("/v1/notebooks")
 async def list_notebooks():
     client = await get_client()
     try:
@@ -636,7 +783,7 @@ async def list_notebooks():
         raise map_rpc_error(e)
 
 
-@app.post("/v1/notebooks")
+@v1.post("/v1/notebooks")
 async def create_notebook(req: NotebookCreateReq):
     client = await get_client()
     try:
@@ -646,7 +793,7 @@ async def create_notebook(req: NotebookCreateReq):
         raise map_rpc_error(e)
 
 
-@app.get("/v1/notebooks/{notebook_id}")
+@v1.get("/v1/notebooks/{notebook_id}")
 async def get_notebook(notebook_id: str):
     client = await get_client()
     try:
@@ -656,7 +803,7 @@ async def get_notebook(notebook_id: str):
         raise map_rpc_error(e)
 
 
-@app.delete("/v1/notebooks/{notebook_id}")
+@v1.delete("/v1/notebooks/{notebook_id}")
 async def delete_notebook(notebook_id: str):
     client = await get_client()
     try:
@@ -666,7 +813,7 @@ async def delete_notebook(notebook_id: str):
         raise map_rpc_error(e)
 
 
-@app.patch("/v1/notebooks/{notebook_id}/rename")
+@v1.patch("/v1/notebooks/{notebook_id}/rename")
 async def rename_notebook(notebook_id: str, req: NotebookRenameReq):
     client = await get_client()
     try:
@@ -676,7 +823,7 @@ async def rename_notebook(notebook_id: str, req: NotebookRenameReq):
         raise map_rpc_error(e)
 
 
-@app.get("/v1/notebooks/{notebook_id}/summary")
+@v1.get("/v1/notebooks/{notebook_id}/summary")
 async def get_notebook_summary(notebook_id: str):
     client = await get_client()
     try:
@@ -686,7 +833,7 @@ async def get_notebook_summary(notebook_id: str):
         raise map_rpc_error(e)
 
 
-@app.get("/v1/notebooks/{notebook_id}/description")
+@v1.get("/v1/notebooks/{notebook_id}/description")
 async def get_notebook_description(notebook_id: str):
     client = await get_client()
     try:
@@ -699,7 +846,7 @@ async def get_notebook_description(notebook_id: str):
 # ----------------------------
 # Sources
 # ----------------------------
-@app.get("/v1/notebooks/{notebook_id}/sources")
+@v1.get("/v1/notebooks/{notebook_id}/sources")
 async def list_sources(notebook_id: str):
     client = await get_client()
     try:
@@ -709,7 +856,7 @@ async def list_sources(notebook_id: str):
         raise map_rpc_error(e)
 
 
-@app.post("/v1/notebooks/{notebook_id}/sources/url")
+@v1.post("/v1/notebooks/{notebook_id}/sources/url")
 async def add_source_url(notebook_id: str, req: SourceAddUrlReq):
     client = await get_client()
     try:
@@ -726,7 +873,7 @@ async def add_source_url(notebook_id: str, req: SourceAddUrlReq):
         raise map_rpc_error(e)
 
 
-@app.post("/v1/notebooks/{notebook_id}/sources/youtube")
+@v1.post("/v1/notebooks/{notebook_id}/sources/youtube")
 async def add_source_youtube(notebook_id: str, req: SourceAddYoutubeReq):
     client = await get_client()
     try:
@@ -742,7 +889,7 @@ async def add_source_youtube(notebook_id: str, req: SourceAddYoutubeReq):
         raise map_rpc_error(e)
 
 
-@app.post("/v1/notebooks/{notebook_id}/sources/text")
+@v1.post("/v1/notebooks/{notebook_id}/sources/text")
 async def add_source_text(notebook_id: str, req: SourceAddTextReq):
     client = await get_client()
     try:
@@ -752,7 +899,7 @@ async def add_source_text(notebook_id: str, req: SourceAddTextReq):
         raise map_rpc_error(e)
 
 
-@app.post("/v1/notebooks/{notebook_id}/sources/file")
+@v1.post("/v1/notebooks/{notebook_id}/sources/file")
 async def add_source_file(
     notebook_id: str,
     upload: UploadFile = File(...),
@@ -777,7 +924,7 @@ async def add_source_file(
             pass
 
 
-@app.get("/v1/notebooks/{notebook_id}/sources/{source_id}/fulltext")
+@v1.get("/v1/notebooks/{notebook_id}/sources/{source_id}/fulltext")
 async def get_source_fulltext(notebook_id: str, source_id: str):
     client = await get_client()
     try:
@@ -787,7 +934,7 @@ async def get_source_fulltext(notebook_id: str, source_id: str):
         raise map_rpc_error(e)
 
 
-@app.get("/v1/notebooks/{notebook_id}/sources/{source_id}/guide")
+@v1.get("/v1/notebooks/{notebook_id}/sources/{source_id}/guide")
 async def get_source_guide(notebook_id: str, source_id: str):
     client = await get_client()
     try:
@@ -797,7 +944,7 @@ async def get_source_guide(notebook_id: str, source_id: str):
         raise map_rpc_error(e)
 
 
-@app.delete("/v1/notebooks/{notebook_id}/sources/{source_id}")
+@v1.delete("/v1/notebooks/{notebook_id}/sources/{source_id}")
 async def delete_source(notebook_id: str, source_id: str):
     client = await get_client()
     try:
@@ -810,7 +957,7 @@ async def delete_source(notebook_id: str, source_id: str):
 # ----------------------------
 # Chat
 # ----------------------------
-@app.post("/v1/notebooks/{notebook_id}/chat/ask")
+@v1.post("/v1/notebooks/{notebook_id}/chat/ask")
 async def chat_ask(notebook_id: str, req: ChatAskReq):
     client = await get_client()
     try:
@@ -826,7 +973,7 @@ async def chat_ask(notebook_id: str, req: ChatAskReq):
 # ----------------------------
 # Artifacts: list / generate / poll / download
 # ----------------------------
-@app.get("/v1/notebooks/{notebook_id}/artifacts")
+@v1.get("/v1/notebooks/{notebook_id}/artifacts")
 async def list_artifacts(notebook_id: str, type: Optional[str] = None):
     client = await get_client()
     try:
@@ -836,7 +983,7 @@ async def list_artifacts(notebook_id: str, type: Optional[str] = None):
         raise map_rpc_error(e)
 
 
-@app.post("/v1/notebooks/{notebook_id}/artifacts/generate")
+@v1.post("/v1/notebooks/{notebook_id}/artifacts/generate")
 async def generate_artifact(notebook_id: str, req: ArtifactGenerateReq):
     client = await get_client()
     try:
@@ -900,7 +1047,7 @@ async def generate_artifact(notebook_id: str, req: ArtifactGenerateReq):
         raise map_rpc_error(e)
 
 
-@app.get("/v1/notebooks/{notebook_id}/artifacts/tasks/{task_id}")
+@v1.get("/v1/notebooks/{notebook_id}/artifacts/tasks/{task_id}")
 async def poll_task(
     notebook_id: str,
     task_id: str,
@@ -945,7 +1092,7 @@ async def poll_task(
         raise map_rpc_error(e)
 
 
-@app.get("/v1/notebooks/{notebook_id}/artifacts/download")
+@v1.get("/v1/notebooks/{notebook_id}/artifacts/download")
 async def download_artifact(
     notebook_id: str,
     type: Literal[
@@ -1027,3 +1174,7 @@ async def download_artifact(
         except OSError:
             pass
         raise map_rpc_error(e)
+
+
+# Mounted last: include_router copies the routes registered so far.
+app.include_router(v1)
